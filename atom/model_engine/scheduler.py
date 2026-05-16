@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -545,7 +546,7 @@ class Scheduler:
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
 
-    def _can_admit_head_prefill(self) -> bool:
+    def _can_admit_head_prefill(self) -> tuple[bool, bool]:
         """Match SGL's `local_prefillable=True` semantics: report True iff
         this rank would *actually* admit a new prefill this tick.
 
@@ -560,11 +561,14 @@ class Scheduler:
         We peek the front of `waiting` (skipping a few unschedulable
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
+
+        Returns `(local_prefillable, local_prefill_sufficient)`.
+        `local_prefillable` keeps the original meaning above.
+        `local_prefill_sufficient` is true only when the visible prefill work
+        count reaches `ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS`.
         """
-        if self._partial_prefill_count > 0:
-            return True
-        if not self.waiting:
-            return False
+        required_prefills = max(1, envs.ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS)
+        admittable_prefills = self._partial_prefill_count
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
@@ -579,9 +583,11 @@ class Scheduler:
             ):
                 continue
             if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
-        return False
+                break  # KV-pressured: definitely cannot prefill
+            admittable_prefills += 1
+            if admittable_prefills >= required_prefills:
+                break
+        return admittable_prefills > 0, admittable_prefills >= required_prefills
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -746,8 +752,10 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
+            local_prefillable, local_sufficient = self._can_admit_head_prefill()
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
+                local_prefillable=local_prefillable,
+                local_prefill_sufficient=local_sufficient,
                 token_usage=self._kv_usage(),
             )
 

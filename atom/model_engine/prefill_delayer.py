@@ -50,6 +50,8 @@ from typing import Optional
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
@@ -97,10 +99,11 @@ class PrefillDelayer:
         # Encoding:
         #   slot 0 = local_prefillable          (MAX → "any rank prefillable")
         #   slot 1 = local_force                (MAX → "any rank forces allow")
-        #   slot 2 = NOT local_prefillable      (MAX → "any rank lacks prefill")
+        #   slot 2 = NOT local_prefill_sufficient
+        #            (MAX → "any rank lacks required prefill count")
         # Then prefillable_status:
-        #   any_prefillable AND any_not_prefillable → "mixed"
-        #   any_prefillable AND NOT any_not_prefillable → "all"
+        #   any_prefillable AND any_not_sufficient → "mixed"
+        #   any_prefillable AND NOT any_not_sufficient → "all"
         #   NOT any_prefillable → "none"
         # Single all_reduce, 3 int64s on cpu — negligible overhead.
         self._reduce_buf = torch.zeros(3, dtype=torch.int64, device="cpu")
@@ -110,7 +113,8 @@ class PrefillDelayer:
         # Skip first negotiation: during warmup / first burst we want
         # decode batch_size to grow as fast as possible. Mirrors SGL
         # PR #19836 (`skip_first_delayer`).
-        self._skip_first: bool = True
+        required_prefills = envs.ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS
+        self._skip_first: bool = required_prefills <= 1
 
         # Aggregate counters for periodic logging
         self._stat_allow = 0
@@ -125,13 +129,15 @@ class PrefillDelayer:
             f"PrefillDelayer initialized: dp_size={dp_size} "
             f"max_delay_passes={max_delay_passes} "
             f"max_delay_ms={max_delay_ms} "
-            f"watermark={token_usage_low_watermark}"
+            f"watermark={token_usage_low_watermark} "
+            f"skip_first={self._skip_first}"
         )
 
     def should_allow_prefill(
         self,
         local_prefillable: bool,
         token_usage: float,
+        local_prefill_sufficient: Optional[bool] = None,
     ) -> bool:
         """
         Returns True iff this rank is allowed to admit new prefills this tick.
@@ -139,10 +145,16 @@ class PrefillDelayer:
         Args:
             local_prefillable: this rank has at least one new prefill ready
                 (i.e. self.waiting non-empty and admission would succeed).
+            local_prefill_sufficient: this rank has enough local prefill work
+                to satisfy the configured scheduler-side threshold. Defaults
+                to `local_prefillable` for compatibility with older callers.
             token_usage: fraction of KV cache blocks currently in use
                 (used_blocks / total_blocks ∈ [0, 1]). Used by the
                 low-watermark safety valve.
         """
+        if local_prefill_sufficient is None:
+            local_prefill_sufficient = local_prefillable
+
         # Local "force allow" if KV cache is underutilized — don't delay
         # when GPU is starving. Only meaningful if this rank actually has
         # a prefill to push through (otherwise force_allow is a no-op).
@@ -157,7 +169,7 @@ class PrefillDelayer:
         # Cross-DP MAX-reduce: 3 booleans encoded as int64.
         self._reduce_buf[0] = 1 if local_prefillable else 0
         self._reduce_buf[1] = 1 if force else 0
-        self._reduce_buf[2] = 0 if local_prefillable else 1
+        self._reduce_buf[2] = 0 if local_prefill_sufficient else 1
         torch.distributed.all_reduce(
             self._reduce_buf,
             op=torch.distributed.ReduceOp.MAX,
@@ -165,11 +177,11 @@ class PrefillDelayer:
         )
         any_prefillable = int(self._reduce_buf[0].item()) > 0
         force_max = int(self._reduce_buf[1].item())
-        any_not_prefillable = int(self._reduce_buf[2].item()) > 0
+        any_not_sufficient = int(self._reduce_buf[2].item()) > 0
 
         # Derive 3-way status: all / none / mixed.
         prefillable_max = 1 if any_prefillable else 0
-        prefillable_min = 0 if any_not_prefillable else 1
+        prefillable_min = 0 if any_not_sufficient else 1
 
         # Watermark short-circuit: ANY rank below the watermark forces all
         # ranks to allow this tick. Without this the delayer can stall a
@@ -211,7 +223,7 @@ class PrefillDelayer:
                     f"[PrefillDelayer] DELAY: count={self._delayed_count} "
                     f"elapsed={elapsed_ms:.1f}ms "
                     f"any_prefillable={any_prefillable} "
-                    f"any_not_prefillable={any_not_prefillable}"
+                    f"any_not_sufficient={any_not_sufficient}"
                 )
             self._maybe_log()
             return False

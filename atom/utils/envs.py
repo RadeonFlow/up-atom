@@ -66,6 +66,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
     ),
+    # Route the MLA-decode qkv_a projection + q/kv a_layernorm through the hand-written
+    # HIP split-K prezero GEMM path (aiter tgemm_prezero / qk_rmsnorm_prezero). Off by
+    # default; bf16 weights + Kimi-K2.5 MLA dims only, decode M<=256 (else falls back).
+    "ATOM_ENABLE_HIP_MLA_QKVA": lambda: (
+        os.getenv("ATOM_ENABLE_HIP_MLA_QKVA", "0") == "1"
+    ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),

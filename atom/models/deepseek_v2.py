@@ -155,6 +155,46 @@ def hip_mla_qkv_a_norm(
     q_eps: float,
     kv_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _hip_mla_qkv_a_norm_impl(
+        hidden_states,
+        qkv_a_weight,
+        q_norm_weight,
+        kv_norm_weight,
+        q_eps,
+        kv_eps,
+        None,
+    )
+
+
+def hip_mla_qkv_a_norm_prezero(
+    hidden_states: torch.Tensor,
+    qkv_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    q_eps: float,
+    kv_eps: float,
+    qkv_a_gemm_zero: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _hip_mla_qkv_a_norm_impl(
+        hidden_states,
+        qkv_a_weight,
+        q_norm_weight,
+        kv_norm_weight,
+        q_eps,
+        kv_eps,
+        qkv_a_gemm_zero,
+    )
+
+
+def _hip_mla_qkv_a_norm_impl(
+    hidden_states: torch.Tensor,
+    qkv_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    q_eps: float,
+    kv_eps: float,
+    qkv_a_gemm_zero: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """OPAQUE custom op (torch.compile-safe): the qkv_a projection + q/kv a_layernorm of the MLA
     decode input stage, bf16. The data-dependent M-bucket / pad / decode-vs-prefill fallback lives
     INSIDE the eager op body so Dynamo never traces it; the forward calls it behind a STATIC
@@ -183,14 +223,16 @@ def hip_mla_qkv_a_norm(
     if gemm_ok:
         from aiter.tuned_gemm import tgemm_prezero
 
-        a = hidden_states
-        if m != bucket:
-            a = hidden_states.new_zeros((bucket, k))
-            a[:m] = hidden_states
-        # op2: qkv_a split-K GEMM into a pre-zeroed buffer (zero_init=false). q_c/kv_c are strided
-        # views of qkv used only internally; k_pe is returned, so it is copied (no view-of-input).
-        qkv = hidden_states.new_zeros((bucket, ql + kl + rope))
-        qkv = tgemm_prezero(qkv, a, qkv_a_weight)
+        # op2: qkv_a split-K GEMM into a pre-zeroed buffer (zero_init=false). The kernel computes
+        # BM=16 for small M, but masks C writes to M and relies on bounded raw-buffer A loads to
+        # produce zero for rows beyond the real A tensor; no padded A fill is needed.
+        qkv = (
+            qkv_a_gemm_zero
+            if qkv_a_gemm_zero is not None
+            and tuple(qkv_a_gemm_zero.shape) == (bucket, ql + kl + rope)
+            else hidden_states.new_zeros((bucket, ql + kl + rope))
+        )
+        qkv = tgemm_prezero(qkv, hidden_states, qkv_a_weight)
         q_c = qkv[:m, :ql]
         kv_c = qkv[:m, ql : ql + kl]
         # op3: q/kv rmsnorm in one launch + k_pe rope-col free-rider (no q_b gemm_zero here — q_b
@@ -232,11 +274,38 @@ def _hip_mla_qkv_a_norm_fake(
     )
 
 
+def _hip_mla_qkv_a_norm_prezero_fake(
+    hidden_states: torch.Tensor,
+    qkv_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    q_eps: float,
+    kv_eps: float,
+    qkv_a_gemm_zero: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _hip_mla_qkv_a_norm_fake(
+        hidden_states,
+        qkv_a_weight,
+        q_norm_weight,
+        kv_norm_weight,
+        q_eps,
+        kv_eps,
+    )
+
+
 direct_register_custom_op(
     op_name="hip_mla_qkv_a_norm",
     op_func=hip_mla_qkv_a_norm,
     mutates_args=(),
     fake_impl=_hip_mla_qkv_a_norm_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+direct_register_custom_op(
+    op_name="hip_mla_qkv_a_norm_prezero",
+    op_func=hip_mla_qkv_a_norm_prezero,
+    mutates_args=("qkv_a_gemm_zero",),
+    fake_impl=_hip_mla_qkv_a_norm_prezero_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 _FP8_DTYPES = tuple(
@@ -2045,6 +2114,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        qkv_a_gemm_zero: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
@@ -2056,16 +2126,29 @@ class DeepseekV2MLAAttention(nn.Module):
                 # HIP split-K prezero path: qkv_a GEMM (into a pre-zeroed buffer, zero_init=false)
                 # + q/kv a_layernorm in one launch (+ k_pe rope-col free-rider). q_b stays in
                 # mla_attn. decode/prefill fallback is decided INSIDE the opaque op (eager).
-                hidden_states_or_q_c, kv_c_normed, k_pe = (
-                    torch.ops.aiter.hip_mla_qkv_a_norm(
-                        hidden_states,
-                        self.fused_qkv_a_proj.weight,
-                        self.q_a_layernorm.weight,
-                        self.kv_a_layernorm.weight,
-                        float(self.q_a_layernorm.eps),
-                        float(self.kv_a_layernorm.eps),
+                if qkv_a_gemm_zero is None:
+                    hidden_states_or_q_c, kv_c_normed, k_pe = (
+                        torch.ops.aiter.hip_mla_qkv_a_norm(
+                            hidden_states,
+                            self.fused_qkv_a_proj.weight,
+                            self.q_a_layernorm.weight,
+                            self.kv_a_layernorm.weight,
+                            float(self.q_a_layernorm.eps),
+                            float(self.kv_a_layernorm.eps),
+                        )
                     )
-                )
+                else:
+                    hidden_states_or_q_c, kv_c_normed, k_pe = (
+                        torch.ops.aiter.hip_mla_qkv_a_norm_prezero(
+                            hidden_states,
+                            self.fused_qkv_a_proj.weight,
+                            self.q_a_layernorm.weight,
+                            self.kv_a_layernorm.weight,
+                            float(self.q_a_layernorm.eps),
+                            float(self.kv_a_layernorm.eps),
+                            qkv_a_gemm_zero,
+                        )
+                    )
                 hidden_states_or_q_c_scale = None
                 used_hip_qkva = True
             elif self.fuse_qknorm_quant and use_triton_gemm():
@@ -2282,6 +2365,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
+        qkv_a_gemm_zero = None
         if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
@@ -2336,15 +2420,29 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
 
         else:
+            if (
+                residual is not None
+                and self.self_attn._use_hip_qkva
+                and hidden_states.dtype == torch.bfloat16
+            ):
+                # Keep this allocation visible to torch.compile. The opaque qkva op still decides
+                # decode-vs-prefill internally; for non-M<=16 cases it ignores this small buffer and
+                # falls back to its original allocation path.
+                qkv_a_gemm_zero = hidden_states.new_empty(
+                    (_HIP_MLA_M_BUCKETS[0], _HIP_MLA_QL + _HIP_MLA_KL + _HIP_MLA_ROPE)
+                )
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, gemm_zero=qkv_a_gemm_zero
+                )
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            qkv_a_gemm_zero=qkv_a_gemm_zero,
         )
 
         if hidden_states.dtype == torch.float16:

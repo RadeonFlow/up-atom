@@ -315,6 +315,7 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
         x_scale: Optional[torch.Tensor] = None,
+        gemm_zero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert (
@@ -338,9 +339,19 @@ class RMSNorm(nn.Module):
                 residual,
                 self.weight,
                 self.eps,
+                gemm_zero=gemm_zero,
             )
             return x, residual
         else:
+            if gemm_zero is not None and residual is not None and x.dtype is torch.bfloat16:
+                from aiter import add_rmsnorm_prezero
+
+                out = torch.empty_like(x)
+                residual_out = torch.empty_like(x)
+                add_rmsnorm_prezero(
+                    out, residual_out, x, residual, self.weight, self.eps, gemm_zero
+                )
+                return out, residual_out
             if x_scale is not None and self.use_fused_quant:
                 import aiter as rocm_aiter
                 from aiter.ops.triton.fused_fp8_quant import (
@@ -398,12 +409,16 @@ class RMSNorm(nn.Module):
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
                     x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+                    if gemm_zero is not None:
+                        gemm_zero.zero_()
                     return x
                 else:
                     # return self.add_rms_forward(x, residual)
                     x, residual = rmsnorm2d_fwd_with_add_(
                         x, self.weight, residual, self.eps, self.dim
                     )
+                    if gemm_zero is not None:
+                        gemm_zero.zero_()
                     return x, residual
 
 

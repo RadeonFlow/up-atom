@@ -2044,6 +2044,56 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
 
+def qkv_a_prezero_decoder_attention(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    ctx = get_forward_context().context
+    qkv_a_gemm_zero = None
+    if not ctx.is_prefill:
+        qkv_a_gemm_zero = hidden_states.new_empty(
+            (
+                hidden_states.shape[0],
+                layer.self_attn.fused_qkv_a_proj.weight.shape[0],
+            )
+        )
+        hidden_states, residual = layer.input_layernorm.forward_with_zero_fill(
+            hidden_states, residual, qkv_a_gemm_zero
+        )
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+
+    hidden_states = layer.self_attn(
+        positions=positions,
+        hidden_states=hidden_states,
+        qkv_a_gemm_zero=qkv_a_gemm_zero,
+    )
+    return hidden_states, residual
+
+
+def qkv_a_prezero_decoder_attention_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="qkv_a_prezero_decoder_attention",
+    op_func=qkv_a_prezero_decoder_attention,
+    mutates_args=(),
+    fake_impl=qkv_a_prezero_decoder_attention_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2063,6 +2113,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
+        self.prefix = prefix
 
         self.self_attn = DeepseekV2MLAAttention(
             config=config,
@@ -2159,6 +2210,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.fuse_rmsnorm_quant = (
             ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
         )
+        if self.self_attn._use_hip_qkva:
+            get_current_atom_config().compilation_config.static_forward_context[
+                prefix
+            ] = self
 
     def forward(
         self,
@@ -2167,7 +2222,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        qkv_a_gemm_zero = None
         if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
@@ -2220,39 +2274,34 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
 
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         else:
-            ctx = get_forward_context().context
-            use_qkv_a_prezero = (
-                residual is not None
-                and self.self_attn._use_hip_qkva
-                and hidden_states.dtype == torch.bfloat16
-                and not ctx.is_prefill
-            )
-            if use_qkv_a_prezero:
-                # Keep this allocation visible to torch.compile. AITER's tgemm_prezero decides
-                # prezero-vs-normal GEMM internally through its CSV dispatch.
-                qkv_a_gemm_zero = hidden_states.new_empty(
-                    (
-                        hidden_states.shape[0],
-                        self.self_attn.fused_qkv_a_proj.weight.shape[0],
-                    )
-                )
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
-            elif qkv_a_gemm_zero is not None:
-                hidden_states, residual = self.input_layernorm.forward_with_zero_fill(
-                    hidden_states, residual, qkv_a_gemm_zero
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+            elif self.self_attn._use_hip_qkva and hidden_states.dtype == torch.bfloat16:
+                hidden_states, residual = (
+                    torch.ops.aiter.qkv_a_prezero_decoder_attention(
+                        hidden_states,
+                        residual,
+                        positions,
+                        self.prefix,
+                    )
                 )
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            qkv_a_gemm_zero=qkv_a_gemm_zero,
-        )
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
 
         if hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

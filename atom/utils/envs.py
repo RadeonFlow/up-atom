@@ -71,6 +71,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_HIP_MLA_QKVA": lambda: (
         os.getenv("ATOM_ENABLE_HIP_MLA_QKVA", "0") == "1"
     ),
+    # Extend the prezero path to the MoE router (gate) GEMM. Gated independently of
+    # qkv_a/q_b and OFF by default — it showed a perf regression under investigation.
+    "ATOM_ENABLE_HIP_MLA_GATE": lambda: (
+        os.getenv("ATOM_ENABLE_HIP_MLA_GATE", "0") == "1"
+    ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),

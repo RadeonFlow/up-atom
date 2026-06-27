@@ -23,6 +23,8 @@ Currently registered:
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
 """
 
+from typing import Optional
+
 import torch
 
 from atom.config import get_current_atom_config
@@ -45,20 +47,26 @@ from atom.utils.custom_register import direct_register_custom_op
 def maybe_dual_stream_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
+    router_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
     threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     num_tokens = hidden_states.shape[0]
-    if self._use_dual_stream and 0 < num_tokens <= threshold:
-        return self.dual_stream_moe_forward(hidden_states)
-    return self.single_stream_moe_forward(hidden_states)
+    use_dual = self._use_dual_stream and 0 < num_tokens <= threshold
+    fn = self.dual_stream_moe_forward if use_dual else self.single_stream_moe_forward
+    # Only forward router_logits when present so MoE implementations that don't take it
+    # (e.g. deepseek_v4) keep working through this shared op.
+    if router_logits is None:
+        return fn(hidden_states)
+    return fn(hidden_states, router_logits)
 
 
 def _maybe_dual_stream_forward_fake(
     hidden_states: torch.Tensor,
     layer_name: str,
+    router_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

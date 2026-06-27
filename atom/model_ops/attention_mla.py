@@ -191,6 +191,10 @@ class MLAAttention(nn.Module):
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
         self.kv_b_proj = mla_modules.kv_b_proj
+        # Pre-zeroed q_b GEMM output buffer, stashed by the MLA module before the
+        # attention splitting op and consumed once by _q_proj_and_k_up_proj. None on
+        # every non-prezero path. See qkv_a_prezero_decoder_attention in deepseek_v2.
+        self._qb_gemm_zero = None
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
@@ -284,10 +288,18 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
-        q_nope, q_pe = (
-            self.q_proj(x, x_scale)
-            .view(-1, self.num_heads, self.qk_head_dim)
-            .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Consume the pre-zeroed q_b buffer once; the bf16 prezero GEMM atomic-adds
+        # into it (CSV miss falls back to a fresh tensor, so use the return value).
+        qb_gemm_zero = self._qb_gemm_zero
+        self._qb_gemm_zero = None
+        if qb_gemm_zero is not None and x_scale is None:
+            from aiter.tuned_gemm import tgemm_prezero
+
+            q = tgemm_prezero(qb_gemm_zero, x, self.q_proj.weight)
+        else:
+            q = self.q_proj(x, x_scale)
+        q_nope, q_pe = q.view(-1, self.num_heads, self.qk_head_dim).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
         # Convert from (B, N, P) to (N, B, P)

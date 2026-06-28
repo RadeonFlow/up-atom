@@ -42,6 +42,7 @@ from aiter import (
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.tuned_gemm import tgemm
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import (
@@ -874,6 +875,18 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
+@torch_compile_guard(
+    mutates_args=["out"], gen_fake=lambda out, a, weight, bias=None: None
+)
+def _mm_prezero_(
+    out: torch.Tensor,
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    tgemm.mm(a, weight, bias, prezero=True, out=out)
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -998,8 +1011,16 @@ class DeepseekV2MoE(nn.Module):
                     prefix=f"{prefix}.shared_experts",
                 )
 
-    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self.gate(hidden_states)
+    def routed_expert_forward(
+        self,
+        hidden_states: torch.Tensor,
+        gate_prezero: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if gate_prezero is not None:
+            _mm_prezero_(gate_prezero, hidden_states, self.gate.weight)
+            router_logits = gate_prezero
+        else:
+            router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -1049,6 +1070,7 @@ class DeepseekV2MoE(nn.Module):
     def single_stream_moe_forward(
         self,
         hidden_states: torch.Tensor,
+        gate_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
         if (
@@ -1057,13 +1079,17 @@ class DeepseekV2MoE(nn.Module):
         ):
             shared_output = self.shared_experts(hidden_states)
 
-        final_hidden_states = self.routed_expert_forward(hidden_states)
+        final_hidden_states = self.routed_expert_forward(hidden_states, gate_prezero)
         final_hidden_states = self.combine_outputs(
             final_hidden_states, shared_output, hidden_states
         )
         return final_hidden_states
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        gate_prezero: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         assert (
             hidden_states.dim() == 2
         ), f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
@@ -1072,10 +1098,12 @@ class DeepseekV2MoE(nn.Module):
         ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
         if self._use_dual_stream:
+            # Dual-stream runs inside an opaque custom op; gate prezero is
+            # single-stream only, so the buffer is never allocated here (None).
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
 
         # Non-dual-stream path: shared experts + routed experts sequentially
-        return self.single_stream_moe_forward(hidden_states)
+        return self.single_stream_moe_forward(hidden_states, gate_prezero)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1919,6 +1947,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        qkva_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
@@ -1950,7 +1979,13 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states_or_q_c = q_c
                 hidden_states_or_q_c_scale = q_c_scale
             else:
-                qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
+                if qkva_prezero is not None:
+                    _mm_prezero_(
+                        qkva_prezero, hidden_states, self.fused_qkv_a_proj.weight
+                    )
+                    qkv_lora = qkva_prezero
+                else:
+                    qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
                 # ckq = self.q_a_proj(hidden_states)
                 q_c, kv_c, k_pe = torch.split(
                     qkv_lora,
@@ -2139,6 +2174,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
+        zero_fill = None
         if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
@@ -2197,11 +2233,26 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                if (
+                    envs.ATOM_ENABLE_SPLITK_PREZERO
+                    and getattr(self.self_attn, "fused_qkv_a_proj", None) is not None
+                    and self.input_layernorm.fused_allreduce
+                    and self.input_layernorm.tp_size > 1
+                ):
+                    zero_fill = torch.empty(
+                        hidden_states.shape[0],
+                        self.self_attn.fused_qkv_a_proj.weight.shape[0],
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, zero_fill=zero_fill
+                )
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            qkva_prezero=zero_fill,
         )
 
         if hidden_states.dtype == torch.float16:
@@ -2215,8 +2266,29 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1.0 / self.routed_scaling_factor
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        gate_zero = None
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and envs.ATOM_ENABLE_SPLITK_PREZERO
+            and not self.mlp._use_dual_stream
+            and self.post_attention_layernorm.fused_allreduce
+            and self.post_attention_layernorm.tp_size > 1
+        ):
+            # The fused allreduce-rmsnorm zeroes this gate buffer on idle CUs; the
+            # MoE then atomic-adds the split-K gate GEMM into it.
+            gate_zero = torch.empty(
+                hidden_states.shape[0],
+                self.mlp.gate.weight.shape[0],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, zero_fill=gate_zero
+        )
+        if isinstance(self.mlp, DeepseekV2MoE):
+            hidden_states = self.mlp(hidden_states, gate_prezero=gate_zero)
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

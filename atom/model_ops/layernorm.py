@@ -317,6 +317,7 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
         x_scale: Optional[torch.Tensor] = None,
+        zero_fill: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert (
@@ -340,6 +341,7 @@ class RMSNorm(nn.Module):
                 residual,
                 self.weight,
                 self.eps,
+                zero_fill=zero_fill,
             )
             return x, residual
         else:

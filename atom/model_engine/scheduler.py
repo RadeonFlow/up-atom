@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -550,13 +551,12 @@ class Scheduler:
     def _prefill_delayer_readiness(self) -> tuple[bool, bool]:
         """Return the local presence and alignment bits for PrefillDelayer.
 
-        TBO prefill splitting needs at least two local prefill requests.
-        When TBO is enabled, wait for each DP rank to be able to admit two
-        requests before reporting "ready"; otherwise keep the legacy one
-        request threshold.
+        ``ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS`` controls how many local
+        prefill requests this rank must be able to admit before reporting
+        alignment-ready. A value of 0 disables the local-count threshold.
         """
-        required = 2 if self.config.enable_tbo else 1
-        count = self._count_admittable_head_prefills(required)
+        required = max(envs.ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS, 0)
+        count = self._count_admittable_head_prefills(max(required, 1))
         return count > 0, count >= required
 
     def _kv_usage(self) -> float:

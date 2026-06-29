@@ -439,6 +439,11 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
+        self.scheduler.set_scheduler_delay_sync_group(
+            cpu_group=self.dp_group,
+            dp_size=config.parallel_config.data_parallel_size,
+        )
+
         if envs.ATOM_ENABLE_PREFILL_DELAYER:
             from atom.model_engine.prefill_delayer import PrefillDelayer
 

@@ -548,16 +548,27 @@ class Scheduler:
             num_batched_tokens += num_new_tokens
         return count
 
-    def _prefill_delayer_readiness(self) -> tuple[bool, bool]:
+    def _prefill_delayer_readiness(
+        self, delay_factor_allows_prefill: bool = True
+    ) -> tuple[bool, bool]:
         """Return the local presence and alignment bits for PrefillDelayer.
 
         ``ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS`` controls how many local
         prefill requests this rank must be able to admit before reporting
         alignment-ready. A value of 0 disables the local-count threshold.
+
+        When the legacy scheduler delay-factor is enabled, fold it into the
+        alignment bit instead of using it as a second local gate after the
+        cross-DP delayer has already made a decision. This preserves the
+        batching delay while keeping all DP ranks on the same prefill/decode
+        choice for the tick.
         """
         required = max(envs.ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS, 0)
         count = self._count_admittable_head_prefills(max(required, 1))
-        return count > 0, count >= required
+        local_prefillable = count > 0
+        if local_prefillable and not delay_factor_allows_prefill:
+            return True, False
+        return local_prefillable, count >= required
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -719,8 +730,13 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
+            _delay_factor_allows_prefill = (
+                self.delay_factor <= 0
+                or not self.waiting
+                or self._passed_delay(time.time())
+            )
             _local_prefillable, _local_alignment_ready = (
-                self._prefill_delayer_readiness()
+                self._prefill_delayer_readiness(_delay_factor_allows_prefill)
             )
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
                 local_prefillable=_local_prefillable,
@@ -758,7 +774,11 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             _delayer_allows_prefill
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (
+                self.prefill_delayer is not None
+                or self.delay_factor <= 0
+                or self._passed_delay(time.time())
+            )
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens

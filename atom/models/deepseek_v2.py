@@ -36,12 +36,14 @@ from aiter import (
     get_hip_quant,
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
+    is_prezero_free,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.tuned_gemm import tgemm
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import (
@@ -872,6 +874,21 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
 
     # logger.info(f"{q_c.shape=}, {q_c_scale.shape=}, {kv_c_normed.shape=}, {k_pe.shape=}, {q_c.stride()=}, {q_c_scale.stride()=}, {kv_c_normed.stride()=}, {k_pe.stride()=}")
     return q_c, q_c_scale, kv_c_normed, k_pe
+
+
+@torch_compile_guard(
+    mutates_args=["out"], gen_fake=lambda out, a, weight, bias=None: None
+)
+def _mm_prezero_(
+    out: torch.Tensor,
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    # The out buffer was pre-zeroed for free by the preceding fused
+    # allreduce-rmsnorm, so skip the in-kernel zero-init and let the split-K
+    # GEMM atomic-add into it (zero_init=False == prezero).
+    tgemm.mm(a, weight, bias, zero_init=False, out=out)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1919,6 +1936,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        qkva_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
@@ -1950,7 +1968,13 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states_or_q_c = q_c
                 hidden_states_or_q_c_scale = q_c_scale
             else:
-                qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
+                if qkva_prezero is not None:
+                    _mm_prezero_(
+                        qkva_prezero, hidden_states, self.fused_qkv_a_proj.weight
+                    )
+                    qkv_lora = qkva_prezero
+                else:
+                    qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
                 # ckq = self.q_a_proj(hidden_states)
                 q_c, kv_c, k_pe = torch.split(
                     qkv_lora,
@@ -2139,6 +2163,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
+        zero_fill = None
+        qkva_prezero = None
+        _pz_ctx = (
+            get_forward_context().context if envs.ATOM_ENABLE_SPLITK_PREZERO else None
+        )
         if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
@@ -2197,11 +2226,31 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                if (
+                    _pz_ctx is not None
+                    and not _pz_ctx.is_prefill
+                    and getattr(self.self_attn, "fused_qkv_a_proj", None) is not None
+                    and self.input_layernorm.fused_allreduce
+                    and self.input_layernorm.tp_size > 1
+                ):
+                    m = hidden_states.shape[0]
+                    n_qkva = self.self_attn.fused_qkv_a_proj.weight.shape[0]
+                    if is_prezero_free(_pz_ctx.graph_bs, n_qkva):
+                        zero_fill = torch.empty(
+                            m,
+                            n_qkva,
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                        qkva_prezero = zero_fill
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, zero_fill=zero_fill
+                )
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            qkva_prezero=qkva_prezero,
         )
 
         if hidden_states.dtype == torch.float16:

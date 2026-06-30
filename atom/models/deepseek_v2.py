@@ -1952,6 +1952,7 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         qkva_prezero: Optional[torch.Tensor] = None,
+        qb_prezero: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
@@ -2046,12 +2047,16 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.indexer_rope_emb,
             )
 
+        # Only thread the q_b prezero buffer when it is actually allocated, so
+        # the prezero-off path (and non-atom attention backends) stays unchanged.
+        mla_kwargs = {} if qb_prezero is None else {"qb_prezero": qb_prezero}
         return self.mla_attn(
             hidden_states_or_q_c,
             kv_c_normed,
             k_pe,
             positions,
             hidden_states_or_q_c_scale,
+            **mla_kwargs,
         )
 
 
@@ -2180,6 +2185,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Self Attention
         zero_fill = None
         qkva_prezero = None
+        qb_prezero = None
         _pz_ctx = (
             get_forward_context().context if envs.ATOM_ENABLE_SPLITK_PREZERO else None
         )
@@ -2248,9 +2254,33 @@ class DeepseekV2DecoderLayer(nn.Module):
                     and self.input_layernorm.fused_allreduce
                     and self.input_layernorm.tp_size > 1
                 ):
+                    # Zero one buffer for free on the fused allreduce-rmsnorm's
+                    # idle CUs, then hand its contiguous blocks to the qkv_a and
+                    # (optionally) q_b split-K GEMMs to atomic-add into. q_b rides
+                    # the same input_layernorm zeroing even though its own
+                    # preceding norm (q_a_layernorm) is a plain local RMSNorm.
                     m = hidden_states.shape[0]
                     n_qkva = self.self_attn.fused_qkv_a_proj.weight.shape[0]
-                    if is_prezero_free(_pz_ctx.graph_bs, n_qkva):
+                    q_b_proj = getattr(self.self_attn, "q_b_proj", None)
+                    # q_b prezero only covers the bf16 q up-proj; a quantized
+                    # q_b_proj keeps its own quant GEMM (no prezero).
+                    n_qb = (
+                        q_b_proj.weight.shape[0]
+                        if q_b_proj is not None
+                        and q_b_proj.quant_type.value == QuantType.No.value
+                        else 0
+                    )
+                    if n_qb and is_prezero_free(_pz_ctx.graph_bs, n_qkva + n_qb):
+                        zero_fill = torch.empty(
+                            m,
+                            n_qkva + n_qb,
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                        flat = zero_fill.view(-1)
+                        qkva_prezero = flat[: m * n_qkva].view(m, n_qkva)
+                        qb_prezero = flat[m * n_qkva :].view(m, n_qb)
+                    elif is_prezero_free(_pz_ctx.graph_bs, n_qkva):
                         zero_fill = torch.empty(
                             m,
                             n_qkva,
@@ -2266,6 +2296,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             qkva_prezero=qkva_prezero,
+            qb_prezero=qb_prezero,
         )
 
         if hidden_states.dtype == torch.float16:

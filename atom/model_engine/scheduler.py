@@ -23,6 +23,7 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
+import torch
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
@@ -442,6 +443,8 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
+        self._scheduler_delay_sync_group = None
+        self._scheduler_delay_sync_dp_size = 1
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -545,9 +548,20 @@ class Scheduler:
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
 
-    def _can_admit_head_prefill(self) -> bool:
-        """Match SGL's `local_prefillable=True` semantics: report True iff
-        this rank would *actually* admit a new prefill this tick.
+    def set_scheduler_delay_sync_group(self, cpu_group, dp_size: int) -> None:
+        """Synchronize scheduler-delay admission across DP ranks.
+
+        ``scheduler_delay_factor`` is rank-local by construction: it depends on
+        local request arrival times and the local previous prefill latency. In
+        DP serving, letting each rank independently decide whether to admit a
+        prefill can create mixed prefill/delay steps. This group lets the
+        scheduler turn those local decisions into one global prefill gate.
+        """
+        self._scheduler_delay_sync_group = cpu_group
+        self._scheduler_delay_sync_dp_size = dp_size
+
+    def _count_admittable_head_prefills(self, limit: int) -> int:
+        """Count how many head prefills this rank can admit this tick.
 
         Just having `self.waiting` non-empty is too coarse — during a
         concurrent-burst workload (e.g. 1k/1k @ high concurrency) every
@@ -559,12 +573,13 @@ class Scheduler:
 
         We peek the front of `waiting` (skipping a few unschedulable
         entries) and check `can_allocate` + token-budget, mirroring the
-        same checks the admission while-loop runs below.
+        same checks the admission while-loop runs below. The count is capped
+        at ``limit`` so the helper stays cheap for the delayer gate.
         """
-        if self._partial_prefill_count > 0:
-            return True
-        if not self.waiting:
-            return False
+        if limit <= 0 or not self.waiting:
+            return 0
+        count = 0
+        num_batched_tokens = 0
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
@@ -579,9 +594,26 @@ class Scheduler:
             ):
                 continue
             if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
-        return False
+                break  # KV-pressured: definitely cannot prefill more now.
+            if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                break
+            count += 1
+            if count >= limit:
+                break
+            num_batched_tokens += num_new_tokens
+        return count
+
+    def _prefill_delayer_readiness(self) -> tuple[bool, bool]:
+        """Return the local presence and alignment bits for PrefillDelayer.
+
+        TBO prefill splitting needs at least two local prefill requests.
+        When TBO is enabled, wait for each DP rank to be able to admit two
+        requests before reporting "ready"; otherwise keep the legacy one
+        request threshold.
+        """
+        required = 2 if self.config.enable_tbo else 1
+        count = self._count_admittable_head_prefills(required)
+        return count > 0, count >= required
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -746,10 +778,18 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
-            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
-                token_usage=self._kv_usage(),
+            _local_prefillable, _local_alignment_ready = (
+                self._prefill_delayer_readiness()
             )
+            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
+                local_prefillable=_local_prefillable,
+                token_usage=self._kv_usage(),
+                local_alignment_ready=_local_alignment_ready,
+            )
+
+        _scheduler_delay_allows_prefill = True
+        if _delayer_allows_prefill and self.delay_factor > 0:
+            _scheduler_delay_allows_prefill = self._passed_delay_synced(time.time())
 
         if not self.running and not self.waiting:
             return None
@@ -783,7 +823,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             _delayer_allows_prefill
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and _scheduler_delay_allows_prefill
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -1840,3 +1880,38 @@ class Scheduler:
         else:
             passed_delay = True
         return passed_delay
+
+    def _passed_delay_synced(self, now: float) -> bool:
+        """Return a DP-wide scheduler-delay decision.
+
+        Local ``_passed_delay`` intentionally remains unchanged for TP-only and
+        single-rank use. With DP, synchronize the decision so all ranks either
+        open or close Phase 2 prefill admission together. If any rank has
+        waiting work but no running decode, allow globally to avoid converting
+        an otherwise useful prefill step into idle dummy execution.
+        """
+        local_passed = self._passed_delay(now)
+        group = self._scheduler_delay_sync_group
+        if group is None or self._scheduler_delay_sync_dp_size <= 1:
+            return local_passed
+
+        local_starving_prefill = bool(self.waiting and not self.running)
+        sync = torch.tensor(
+            [
+                0 if local_passed else 1,  # any blocked rank closes the gate
+                1 if local_starving_prefill else 0,  # starving rank opens it
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        try:
+            torch.distributed.all_reduce(
+                sync, op=torch.distributed.ReduceOp.MAX, group=group
+            )
+        except RuntimeError as exc:
+            logger.warning("scheduler delay sync failed, using local decision: %s", exc)
+            return local_passed
+
+        any_blocked = int(sync[0].item()) > 0
+        any_starving_prefill = int(sync[1].item()) > 0
+        return any_starving_prefill or not any_blocked

@@ -3513,6 +3513,7 @@ class FusedMoE(torch.nn.Module):
             if _tbo:
                 from atom.utils.tbo.ubatching import (
                     tbo_switch_to_compute_sync,
+                    tbo_yield_and_switch_from_comm_to_compute,
                     tbo_yield_and_switch_from_compute_to_comm,
                 )
 

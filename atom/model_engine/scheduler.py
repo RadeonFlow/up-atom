@@ -753,6 +753,12 @@ class Scheduler:
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
             local_prefillable, local_sufficient = self._can_admit_head_prefill()
+            _delay_factor_allows_prefill = (
+                self.delay_factor <= 0
+                or not self.waiting
+                or self._passed_delay(time.time())
+            )
+            local_sufficient &= _delay_factor_allows_prefill
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
                 local_prefillable=local_prefillable,
                 local_prefill_sufficient=local_sufficient,
@@ -791,7 +797,11 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             _delayer_allows_prefill
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (
+                self.prefill_delayer is not None
+                or self.delay_factor <= 0
+                or self._passed_delay(time.time())
+            )
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens

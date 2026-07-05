@@ -233,6 +233,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
+    # Number of local prefill requests required to allow prefill
+    "ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS", "1")
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

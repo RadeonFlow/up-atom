@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -447,6 +448,7 @@ class Scheduler:
         self._prefill_hold_max_passes = 30
         _pc = getattr(config, "parallel_config", None)
         self._prefill_gate_enabled = getattr(_pc, "data_parallel_size", 1) > 1
+        self.prefill_delay_req = max(1, envs.ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS)
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
@@ -550,7 +552,7 @@ class Scheduler:
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
 
-    def _can_admit_head_prefill(self) -> bool:
+    def _can_admit_head_prefill(self) -> tuple[bool, bool]:
         """Match SGL's `local_prefillable=True` semantics: report True iff
         this rank would *actually* admit a new prefill this tick.
 
@@ -565,11 +567,14 @@ class Scheduler:
         We peek the front of `waiting` (skipping a few unschedulable
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
+
+        Returns `(local_prefillable, local_prefill_sufficient)`.
+        `local_prefillable` keeps the original meaning above.
+        `local_prefill_sufficient` is true only when the visible prefill work
+        count reaches `ATOM_PREFILL_DELAYER_REQUIRED_PREFILLS`.
         """
-        if self._partial_prefill_count > 0:
-            return True
-        if not self.waiting:
-            return False
+        required_prefills = self.prefill_delay_req
+        admittable_prefills = self._partial_prefill_count
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
@@ -584,9 +589,11 @@ class Scheduler:
             ):
                 continue
             if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
-        return False
+                break  # KV-pressured: definitely cannot prefill
+            admittable_prefills += 1
+            if admittable_prefills >= required_prefills:
+                break
+        return admittable_prefills > 0, admittable_prefills >= required_prefills
 
     def _waiting_prefill_tokens(self) -> int:
         """Sum of admissible new-prefill tokens sitting in the waiting queue,
@@ -814,18 +821,32 @@ class Scheduler:
             # can admit a prefill AND has a full batch's worth of waiting tokens.
             # This makes all ranks align on firing dense prefills together
             # instead of straggling partials.
-            _local_prefillable = self._can_admit_head_prefill() and (
-                self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold
-            )
+            _local_prefillable, _local_sufficient = self._can_admit_head_prefill()
+            if self.prefill_delay_req <= 1:
+                _local_sufficient = None
+                _local_prefillable &= (
+                    self._waiting_prefill_tokens() >= self.prefill_batch_token_threshold
+                )
+            else:
+                _delay_factor_allows_prefill = (
+                    self.delay_factor <= 0
+                    or not self.waiting
+                    or self._passed_delay(time.time())
+                )
+                _local_sufficient &= _delay_factor_allows_prefill
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
                 local_prefillable=_local_prefillable,
+                local_prefill_sufficient=_local_sufficient,
                 token_usage=self._kv_usage(),
             )
 
         if not self.running and not self.waiting:
             return None
 
-        _new_prefill_allowed = _delayer_allows_prefill and self._prefill_batch_ready()
+        _new_prefill_allowed = _delayer_allows_prefill
+        if self.prefill_delay_req <= 1:
+            _new_prefill_allowed &= self._prefill_batch_ready()
+        
 
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `_delayer_allows_prefill` so cross-DP alignment still
@@ -856,7 +877,11 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             _new_prefill_allowed
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (
+                self.prefill_delayer is not None
+                or self.delay_factor <= 0
+                or self._passed_delay(time.time())
+            )
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens

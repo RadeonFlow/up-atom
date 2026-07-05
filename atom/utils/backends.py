@@ -656,26 +656,25 @@ class VllmBackend:
         self.graph = graph
         # self.configure_post_pass()
 
-        # aiter pre-split prezero hook (env-gated). Runs on the FULL graph before
-        # splitting, where the opaque attention node (with its qb_prezero slot) is
-        # still visible -- lets the pass wire q_b prezero automatically.
+        # aiter pre-split prezero hook (env-gated by AITER_PREZERO_PRESPLIT). Runs
+        # on the FULL graph before splitting, where the opaque attention node
+        # (with its qb_prezero/oproj_prezero slots) is still visible -- lets the
+        # pass wire the attn-internal q_b/o_proj prezero automatically. Widths
+        # (n_total/n_base) are static module attrs not present in the graph.
         import os as _os
-        _pspath = _os.getenv("AITER_PREZERO_PRESPLIT")
-        if _pspath:
+        if _os.getenv("AITER_PREZERO_PRESPLIT"):
             try:
-                # resolve {attn layer_name -> q_b prezero_n_total} from the live
-                # modules (n_total = n_qkva + n_qb is a static attr not in the graph)
-                _nmap = {}
+                from aiter.compile.pz_presplit import presplit_pass
+
+                _nt_map, _nb_map = {}, {}
                 for _ln, _mod in self.compilation_config.static_forward_context.items():
                     for _sub in _mod.modules():
                         _nt = getattr(_sub, "prezero_n_total", None)
                         if _nt:
-                            _nmap[_ln] = int(_nt)
+                            _nt_map[_ln] = int(_nt)
+                            _nb_map[_ln] = int(getattr(_sub, "prezero_n_base", _nt))
                             break
-                import sys as _sys
-                _sys.path.insert(0, _pspath)
-                import pz_presplit
-                pz_presplit.presplit_pass(graph, _nmap)
+                presplit_pass(graph, _nt_map, _nb_map)
                 graph.recompile() if hasattr(graph, "recompile") else None
             except Exception as _e:
                 import traceback as _tb

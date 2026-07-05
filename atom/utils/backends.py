@@ -519,17 +519,6 @@ class VllmBackend:
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
 
-        # aiter split-K prezero pass. Injected into this backend's
-        # inductor_compile_config so it runs only in the main compile process,
-        # not inductor's compile-worker subprocesses. No-op unless
-        # AITER_ENABLE_SPLITK_PREZERO=1.
-        try:
-            from aiter.compile.prezero import register
-
-            register(self.compilation_config.inductor_compile_config)
-        except Exception as _e:
-            print(f"[aiter.prezero] register failed: {_e}", flush=True)
-
         self.compiler_manager: CompilerManager = CompilerManager(
             self.compilation_config
         )
@@ -656,15 +645,15 @@ class VllmBackend:
         self.graph = graph
         # self.configure_post_pass()
 
-        # aiter pre-split prezero hook (env-gated by AITER_PREZERO_PRESPLIT). Runs
+        # aiter pre-split prezero hook (env-gated by ATOM_ENABLE_PREZERO). Runs
         # on the FULL graph before splitting, where the opaque attention node
         # (with its qb_prezero/oproj_prezero slots) is still visible -- lets the
         # pass wire the attn-internal q_b/o_proj prezero automatically. Widths
         # (n_total/n_base) are static module attrs not present in the graph.
         import os as _os
-        if _os.getenv("AITER_PREZERO_PRESPLIT"):
+        if _os.getenv("ATOM_ENABLE_PREZERO"):
             try:
-                from aiter.compile.pz_presplit import presplit_pass
+                from atom.models.deepseek_v2_prezero import deepseek_v2_prezero_pass
 
                 _nt_map, _nb_map = {}, {}
                 for _ln, _mod in self.compilation_config.static_forward_context.items():
@@ -674,11 +663,11 @@ class VllmBackend:
                             _nt_map[_ln] = int(_nt)
                             _nb_map[_ln] = int(getattr(_sub, "prezero_n_base", _nt))
                             break
-                presplit_pass(graph, _nt_map, _nb_map)
+                deepseek_v2_prezero_pass(graph, _nt_map, _nb_map)
                 graph.recompile() if hasattr(graph, "recompile") else None
             except Exception as _e:
                 import traceback as _tb
-                print(f"[pz_presplit] {_e}\n{_tb.format_exc()}", flush=True)
+                print(f"[prezero] {_e}\n{_tb.format_exc()}", flush=True)
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph, self.compilation_config.splitting_ops

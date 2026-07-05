@@ -16,7 +16,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 
 from atom.config import get_current_atom_config
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -26,11 +25,9 @@ def _prezero_hidden() -> int:
 
 
 def prezero_active(n_total: int) -> bool:
-    # ATOM_ENABLE_SPLITK_PREZERO drives the manual eager wiring; AITER_PREZERO_PRESPLIT
-    # drives the aiter pre-split compile pass (which injects the same maybe_prezero ops
-    # + threads qb_prezero into the attention op). Either enables the runtime gate.
     import os
-    if not (envs.ATOM_ENABLE_SPLITK_PREZERO or os.getenv("AITER_PREZERO_PRESPLIT")):
+
+    if not os.getenv("ATOM_ENABLE_PREZERO"):
         return False
     ctx = get_forward_context().context
     return (not ctx.is_prefill) and is_prezero_free(
@@ -73,7 +70,7 @@ def ar_rmsnorm_maybe_prezero_(
     import os
 
     zf = None
-    if envs.ATOM_ENABLE_SPLITK_PREZERO or os.getenv("AITER_PREZERO_PRESPLIT"):
+    if os.getenv("ATOM_ENABLE_PREZERO"):
         ctx = get_forward_context().context
         if not ctx.is_prefill:
             bs = ctx.graph_bs

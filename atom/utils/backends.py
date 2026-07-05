@@ -519,6 +519,17 @@ class VllmBackend:
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
 
+        # aiter split-K prezero pass. Injected into this backend's
+        # inductor_compile_config so it runs only in the main compile process,
+        # not inductor's compile-worker subprocesses. No-op unless
+        # AITER_ENABLE_SPLITK_PREZERO=1.
+        try:
+            from aiter.compile.prezero import register
+
+            register(self.compilation_config.inductor_compile_config)
+        except Exception as _e:
+            print(f"[aiter.prezero] register failed: {_e}", flush=True)
+
         self.compiler_manager: CompilerManager = CompilerManager(
             self.compilation_config
         )
@@ -644,6 +655,31 @@ class VllmBackend:
 
         self.graph = graph
         # self.configure_post_pass()
+
+        # aiter pre-split prezero hook (env-gated). Runs on the FULL graph before
+        # splitting, where the opaque attention node (with its qb_prezero slot) is
+        # still visible -- lets the pass wire q_b prezero automatically.
+        import os as _os
+        _pspath = _os.getenv("AITER_PREZERO_PRESPLIT")
+        if _pspath:
+            try:
+                # resolve {attn layer_name -> q_b prezero_n_total} from the live
+                # modules (n_total = n_qkva + n_qb is a static attr not in the graph)
+                _nmap = {}
+                for _ln, _mod in self.compilation_config.static_forward_context.items():
+                    for _sub in _mod.modules():
+                        _nt = getattr(_sub, "prezero_n_total", None)
+                        if _nt:
+                            _nmap[_ln] = int(_nt)
+                            break
+                import sys as _sys
+                _sys.path.insert(0, _pspath)
+                import pz_presplit
+                pz_presplit.presplit_pass(graph, _nmap)
+                graph.recompile() if hasattr(graph, "recompile") else None
+            except Exception as _e:
+                import traceback as _tb
+                print(f"[pz_presplit] {_e}\n{_tb.format_exc()}", flush=True)
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph, self.compilation_config.splitting_ops

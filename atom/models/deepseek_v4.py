@@ -3270,6 +3270,7 @@ class Block(nn.Module):
             self.norm_eps,
         )
         x = hc_state.x_prev
+        hc_state.x_prev = None
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)

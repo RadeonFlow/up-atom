@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
+import threading
+import weakref
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -88,6 +91,7 @@ class MoEActivationQuant(Enum):
 
 
 _TBO_KEEPALIVE: dict[tuple[str, int], tuple[torch.Tensor, ...]] = {}
+_TBO_RACE_TEN: dict = {}
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -3583,15 +3587,180 @@ class FusedMoE(torch.nn.Module):
 
     def _hold_tbo_keepalive(self, role: str, *tensors: torch.Tensor) -> None:
         tensors = tuple(tensor for tensor in tensors if tensor is not None)
+        slot = self._tbo_keepalive_slot()
+        if not int(os.getenv("TBO_KEEPALIVE", "0")):
+            return
         if tensors:
             # Keep one previous tensor set per ubatch/role alive globally.
             # The next same-role hold, often in the next MoE layer, happens
             # after this ubatch has waited on the prior comm work, so
             # overwriting here is the delayed safe release point.
-            key = (role, self._tbo_keepalive_slot())
+            key = (role, slot)
             if key in _TBO_KEEPALIVE:
                 del _TBO_KEEPALIVE[key]
             _TBO_KEEPALIVE[key] = tensors
+    
+    def _tbo_record(self, role: str, *tensors: torch.Tensor) -> None:
+        tensors = tuple(tensor for tensor in tensors if tensor is not None)
+        slot = self._tbo_keepalive_slot()
+        if not int(os.getenv("TBO_REUSE_CHURN", "0")):
+            return
+        if tensors:
+            key = (role, slot)
+            if key in _TBO_RACE_TEN:
+                del _TBO_RACE_TEN[key]
+            _TBO_RACE_TEN[key] = [
+                (ten.data_ptr(), ten.nbytes, ten.device, weakref.ref(ten))
+                for ten in tensors
+            ]
+        del tensors
+    
+    def _tbo_race(self, role: str):
+        slot = self._tbo_keepalive_slot()
+        key = None
+        if slot == 1 and role == 'ag':
+            # race ag0
+            key = ('ag', 0)
+        elif slot == 0 and role == 'rs':
+            # race ag1
+            key = ('ag', 1)
+        if not key or not key in _TBO_RACE_TEN:
+            return
+        tens = _TBO_RACE_TEN[key]
+        allocator_blocks = []
+        try:
+            for segment in torch.cuda.memory_snapshot():
+                segment_address = segment["address"]
+                segment_end = segment_address + segment["total_size"]
+                if not any(
+                    segment_address <= addr < segment_end
+                    for addr, _, _, _ in tens
+                ):
+                    continue
+                for block in segment["blocks"]:
+                    allocator_blocks.append(
+                        (
+                            block["address"],
+                            block["address"] + block["size"],
+                            block,
+                            segment,
+                        )
+                    )
+        except Exception:
+            logger.exception("Failed to inspect the CUDA allocator snapshot")
+
+        poison_hits = []
+        for addr, nbytes, device, tensor_ref in tens:
+            tensor_alive = tensor_ref() is not None
+            allocation = next(
+                (
+                    (block, segment)
+                    for block_start, block_end, block, segment in allocator_blocks
+                    if block_start <= addr < block_end
+                ),
+                None,
+            )
+            if allocation is None:
+                logger.info(
+                    "TBO allocator target state: role=%s layer=%s "
+                    "producer_role=%s producer_ubatch=%d consumer_ubatch=%d "
+                    "target=%#x tensor_bytes=%d target_device=%s tensor_alive=%s "
+                    "allocator_state=not_found",
+                    role,
+                    self.layer_name,
+                    key[0],
+                    key[1],
+                    slot,
+                    addr,
+                    nbytes,
+                    device,
+                    tensor_alive,
+                )
+            else:
+                block, segment = allocation
+                logger.info(
+                    "TBO allocator target state: role=%s layer=%s "
+                    "producer_role=%s producer_ubatch=%d consumer_ubatch=%d "
+                    "target=%#x tensor_bytes=%d target_device=%s tensor_alive=%s "
+                    "allocator_state=%s block_addr=%#x block_size=%d "
+                    "requested_size=%d segment_addr=%#x segment_size=%d "
+                    "segment_type=%s allocator_stream=%s device=%s",
+                    role,
+                    self.layer_name,
+                    key[0],
+                    key[1],
+                    slot,
+                    addr,
+                    nbytes,
+                    device,
+                    tensor_alive,
+                    block["state"],
+                    block["address"],
+                    block["size"],
+                    block.get("requested_size", -1),
+                    segment["address"],
+                    segment["total_size"],
+                    segment.get("segment_type", "unknown"),
+                    segment.get("stream", "unknown"),
+                    segment.get("device", "unknown"),
+                )
+            ten_list = []
+            for i in range(64):
+                ten = torch.empty(nbytes, dtype=torch.uint8, device=device)
+                if ten.data_ptr() == addr:
+                    ten.fill_(255)
+                    poison_hits.append(ten)
+                    logger.warning(
+                        "TBO allocator reuse HIT: role=%s layer=%s "
+                        "producer_role=%s producer_ubatch=%d "
+                        "consumer_ubatch=%d ptr=%#x bytes=%d attempt=%d "
+                        "tensor_alive=%s",
+                        role,
+                        self.layer_name,
+                        key[0],
+                        key[1],
+                        slot,
+                        addr,
+                        nbytes,
+                        i + 1,
+                        tensor_alive,
+                    )
+                    break
+                ten_list.append(ten)
+            else:
+                logger.info(
+                    "TBO allocator reuse miss: role=%s layer=%s "
+                    "producer_role=%s producer_ubatch=%d "
+                    "consumer_ubatch=%d target=%#x bytes=%d attempts=%d "
+                    "tensor_alive=%s",
+                    role,
+                    self.layer_name,
+                    key[0],
+                    key[1],
+                    slot,
+                    addr,
+                    nbytes,
+                    len(ten_list),
+                    tensor_alive,
+                )
+            del ten_list
+        # Keep matching poison allocations alive until every recorded target
+        # has been processed at this race-injection point.
+        del poison_hits
+
+    @staticmethod
+    def _snapshot_tbo_storages(*tensors: torch.Tensor) -> tuple[tuple, ...]:
+        """Capture allocation metadata without retaining Tensor references."""
+        if not int(os.getenv("TBO_REUSE_CHURN", "0")):
+            return ()
+        storages = {}
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            storage = tensor.untyped_storage()
+            ptr = storage.data_ptr()
+            storages[ptr] = (ptr, storage.nbytes(), tensor.device)
+        return tuple(storages.values())
 
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
@@ -3624,6 +3793,7 @@ class FusedMoE(torch.nn.Module):
 
                 tbo_yield_and_switch_from_compute_to_comm()
                 self._hold_tbo_keepalive("ag_source", hidden_states, router_logits)
+                self._tbo_race('ag')
 
             (
                 hidden_states,
@@ -3635,8 +3805,21 @@ class FusedMoE(torch.nn.Module):
             )
 
             if _tbo:
+                self._tbo_record('ag', hidden_states, router_logits)
                 tbo_switch_to_compute_sync()
                 self._hold_tbo_keepalive("ag_output", hidden_states, router_logits)
+
+                # Race-reproducer only: delay this ubatch's MoE consumer on the
+                # compute stream, giving the other ubatch's comm-stream poison
+                # a chance to overwrite a prematurely recycled AG output.
+                # torch.cuda._sleep takes device cycles; 4.8M measures about
+                # 2 ms on the gfx950 systems used for this investigation.
+                if int(os.getenv("TBO_REUSE_CHURN", "0")):
+                    sleep_cycles = int(
+                        os.getenv("TBO_POISON_SLEEP_CYCLES", "4800000")
+                    )
+                    if sleep_cycles > 0:
+                        torch.cuda._sleep(sleep_cycles)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -3658,12 +3841,14 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
         )
+        del hidden_states, router_logits
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
                 self._hold_tbo_keepalive("rs_source", final_hidden_states)
+                self._tbo_race('rs')
             if dp_eager_mode:
                 final_hidden_states = reduce_scatterv(
                     final_hidden_states, sizes, dp_group
